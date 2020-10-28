@@ -1,0 +1,103 @@
+#!/bin/bash
+
+#SBATCH --partition=batch
+#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks=2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem-per-cpu=3072
+##SBATCH --time=60:00
+#SBATCH --output=outfile-%J
+#SBATCH --gpus=8
+set -eux
+
+## Required variables
+export MOUNT=/data
+export CONCURRENTGPU='4'
+export MASTER="spark://`hostname`:7077"
+export GPU_PER_NODE=$(( ${SLURM_GPUS} / ${SLURM_JOB_NUM_NODES} ))
+export TOTAL_CORES=$(( ${SLURM_CPUS_PER_TASK} * ${SLURM_NTASKS} ))
+export NUM_EXECUTORS=$SLURM_GPUS
+export NUM_EXECUTOR_CORES=$(( ${TOTAL_CORES} / ${NUM_EXECUTORS} ))
+export SPARK_WORKER_CORES=`nproc`
+export SPARK_WORKER_MEMORY=$(( $SPARK_WORKER_CORES * $SLURM_MEM_PER_CPU ))M
+export RESOURCE_GPU_AMT=$(echo $(( 1000 * ${NUM_EXECUTORS} / ${TOTAL_CORES} )) |sed 's/...$/.&/')
+export WORKER_OPTS="-Dspark.worker.resource.gpu.amount=$GPU_PER_NODE -Dspark.worker.resource.gpu.discoveryScript=/opt/sparkRapidsPlugin/getGpusResources.sh"
+
+sudo mkdir -p ${MOUNT}/conf
+sudo chown -R $(id -u):$(id -g) ${MOUNT}/conf
+sudo cp wait-worker.sh ${MOUNT}/conf/wait-worker.sh
+sudo chmod +x ${MOUNT}/conf/wait-worker.sh
+
+srun -pdebug --ntasks="${SLURM_JOB_NUM_NODES}" bash -c "echo -n 'Clearing cache on ' && hostname && sync && sudo /sbin/sysctl vm.drop_caches=3"
+
+scontrol show hostname $SLURM_JOB_NODELIST > ${MOUNT}/conf/slaves
+
+env=${MOUNT}/conf/spark-env.sh
+echo "export CONCURRENTGPU=$CONCURRENTGPU" >> $env
+echo "export MASTER=$MASTER" >> $env
+echo "export SPARK_WORKER_CORES=$SPARK_WORKER_CORES" >> $env
+echo "export SPARK_WORKER_MEMORY=$SPARK_WORKER_MEMORY" >> $env
+echo "export GPU_PER_NODE=$GPU_PER_NODE" >> $env
+echo "export TOTAL_CORES=$TOTAL_CORES" >> $env
+echo "export NUM_EXECUTORS=$NUM_EXECUTORS" >> $env
+echo "export NUM_EXECUTOR_CORES=$NUM_EXECUTOR_CORES" >> $env
+echo "export RESOURCE_GPU_AMT=$RESOURCE_GPU_AMT" >> $env
+echo "export WORKER_OPTS='$WORKER_OPTS'" >> $env
+sudo chmod +x ${MOUNT}/conf/spark-env.sh
+
+conf=${MOUNT}/conf/spark-defaults.conf
+echo "spark.default.parallelism" $(( $SLURM_CPUS_PER_TASK * $SLURM_NTASKS )) > $conf
+echo "spark.submit.deployMode" client >> $conf
+echo "spark.master" spark://`hostname`:7077 >> $conf
+echo "spark.executor.cores" $NUM_EXECUTOR_CORES >> $conf
+echo "spark.executor.memory" $((( $SLURM_CPUS_PER_TASK * $SLURM_MEM_PER_CPU / $GPU_PER_NODE )))M >> $conf
+echo "spark.executor.instances" $SLURM_GPUS >> $conf
+echo "spark.driver.memory" 10g >> $conf
+
+srun -pdebug -n 1 -N 1 --gpus=0 -w `hostname` docker run -dit \
+-v ${MOUNT}/conf/spark-env.sh:/opt/spark/conf/spark-env.sh \
+-v ${MOUNT}/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf \
+-e MASTER=$MASTER \
+--network host \
+--name master \
+--rm \
+gcr.io/data-science-enterprise/spark-master-rapids-cuda:3.0.1
+
+srun -pdebug -n $SLURM_JOB_NUM_NODES --ntasks-per-node=1 docker run -dit \
+-e MASTER=$MASTER \
+-e RESOURCE_GPU_AMT="$RESOURCE_GPU_AMT" \
+-e SPARK_WORKER_CORES=`nproc` \
+-e SPARK_WORKER_MEMORY=$SPARK_WORKER_MEMORY \
+-e SPARK_WORKER_OPTS="$WORKER_OPTS" \
+-v ${MOUNT}/conf/spark-env.sh:/opt/spark/conf/spark-env.sh \
+-v ${MOUNT}/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf \
+--network host \
+--name worker \
+--rm \
+gcr.io/data-science-enterprise/spark-worker-rapids-cuda:3.0.1
+
+srun -pdebug -n 1 -N 1 --gpus=0 -w `hostname` bash -c  echo `hostname` && $MOUNT/conf/wait-worker.sh
+
+echo "All workers registered!"
+
+srun -pdebug -n 1 -N 1 --gpus=0 docker run -dit \
+-e MASTER=$MASTER \
+-e RESOURCE_GPU_AMT="$RESOURCE_GPU_AMT" \
+-e SPARK_WORKER_CORES=`nproc` \
+-e SPARK_WORKER_MEMORY=$SPARK_WORKER_MEMORY \
+-e SPARK_WORKER_OPTS="$WORKER_OPTS" \
+-v ${MOUNT}/conf/spark-env.sh:/opt/spark/conf/spark-env.sh \
+-v ${MOUNT}/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf \
+-v ${MOUNT}:${MOUNT} \
+--network host \
+--name submit \
+--rm \
+gcr.io/data-science-enterprise/spark:3.0.1 \
+bash -c $MOUNT/bbsql/submit-bbsql-gpu.sh &
+
+echo "test complete" && sleep infinity
+
+##srun -pdebug -n 1 -N 1 --gpus=0 docker kill master
+##srun -pdebug -n $SLURM_JOB_NUM_NODES --ntasks-per-node=1 --gpus=0 docker kill worker
+
+##sleep infinity
