@@ -2,7 +2,7 @@
 
 #SBATCH --partition=batch
 #SBATCH --ntasks-per-node=1
-#SBATCH --ntasks=2
+#SBATCH --ntasks=4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem-per-cpu=3072
 ##SBATCH --time=60:00
@@ -13,11 +13,11 @@ set -eux
 
 ## User defined variables for running BBSQL
 export MOUNT=/data
-export CONCURRENTGPU='4'
-export QUERY='Q5'
+export CONCURRENTGPU='1'
+export QUERY='Q8'
 export DRIVER_MEMORY='10240'
 export PARTITIONBYTES='512M'
-export PARTITIONS='64'
+export PARTITIONS='128'
 export BROADCASTTHRESHOLD='512M'
 export INPUT_PATH="file:///opt/parquet"
 export OUTPUT_PATH="file:///opt/results"
@@ -48,10 +48,13 @@ sudo cp wait-worker.sh ${MOUNT}/conf/wait-worker.sh
 sudo chmod +x ${MOUNT}/conf/wait-worker.sh
 
 srun -n 1 -N 1 --gpus=0 -w `hostname` docker kill master &
+sleep 2
 srun --ntasks="${SLURM_JOB_NUM_NODES}" docker kill worker &
 sleep 2
 srun -n 1 -N 1 --gpus=0 -w `hostname` docker rm master &
+sleep 2
 srun --ntasks="${SLURM_JOB_NUM_NODES}" docker rm worker &
+sleep 2
 srun --ntasks="${SLURM_JOB_NUM_NODES}" bash -c "echo -n 'Clearing cache on ' && hostname && sync && sudo /sbin/sysctl vm.drop_caches=3"
 
 scontrol show hostname $SLURM_JOB_NODELIST > ${MOUNT}/conf/slaves
